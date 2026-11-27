@@ -26,19 +26,61 @@ PAN-OS `TRAFFIC`, `THREAT`, `SYSTEM`, `CONFIG`, and `GLOBALPROTECT` CSV logs are
 
 The `Events` table is partitioned by month and has a clustered columnstore index ordered on `EventTime`. Common filters (addresses, zones, action, app, user, bytes, threat, interface, mnemonic) are real columns. Less common fields are in `ExtraJson`. A background job deletes events older than the configured retention (default 90 days) and splits the next monthly partition when needed.
 
-Search compiles a subset of SPL to parameterized T-SQL. Values never become SQL text. The subset is:
+Search accepts the field names used by the Splunk Add-on for Palo Alto Networks and the Splunk Add-on for Cisco IOS, plus the CIM aliases those apps add. A pipeline that is only filtering, `stats`, `timechart`, `top`/`rare`, `table`, `fields`, `sort`, `head`/`tail`, `rename`, `dedup`, and basic `eval` is translated to parameterized T-SQL. Anything else runs in the API after a parameterized event fetch (capped at 20,000 events in the selected time range). An unknown command fails with `Search command 'tstats' is not supported` rather than being treated as search text.
 
-| Command | Support |
+`index=` is accepted and does not filter. Spunk keeps one store, so a copied `index=pan_logs` still returns the matching sourcetype. `earliest=` and `latest=` work inline (`-15m`, `-24h@h`, `now`) or from the time picker.
+
+### Commands
+
+| Command | What works |
 | --- | --- |
-| search terms | `field=value`, `!=`, `<`, `>`, `<=`, `>=`, `AND` / `OR` / `NOT`, parentheses, `*` and `?` wildcards, free text |
-| where | same comparisons, plus `isnull`, `isnotnull`, `like` |
-| stats | `count`, `dc`, `sum`, `avg`, `min`, `max`, `values` … `by` |
+| search | `field=value`, `!=`, `<`, `>`, `<=`, `>=`, `AND` / `OR` / `NOT`, parentheses, `*` and `?`, `field IN (...)`, bare subsearches `[search ...]` |
+| where | comparisons, `isnull`, `isnotnull`, `like`, `cidrmatch`, `match` |
+| stats | `count`, `dc` / `distinct_count`, `sum`, `avg`, `min`, `max`, `values`, `list`, `earliest`, `latest`, `first`, `last`, `median`, `stdev`, `stdevp`, `perc95`, `perc99` … `by` |
+| eventstats, streamstats | same aggregations; `streamstats` accepts `window=` |
 | timechart | `span=` and `by` |
-| top / rare | with optional `by` |
+| chart | `chart count over field by field` |
+| bin / bucket | `span=` on `_time` or a number |
+| top / rare | `limit=`, a bare number, `by`, `showperc=t|f` |
+| rex | named groups `(?<field>...)`, `field=`, `mode=sed` with `s/pattern/replacement/flags` |
+| transaction | `maxspan=`, `maxpause=`, producing `eventcount` and `duration` |
+| join | `type=inner|left`, field list, `[subsearch]`. One match per key, matching Splunk's default |
+| append | `[subsearch]` concatenated onto the current results |
+| lookup | `lookup name field OUTPUT other as alias`. CSV files are managed under Lookups |
+| inputlookup / outputlookup | read or replace a named CSV |
+| iplocation | sets `Country`, `City`, `Region`, `lat`, `lon`. A small built-in table covers the sample generator's public addresses. Point `GeoIp:CsvPath` at a GeoLite2-style CSV (`network,country,city,region,lat,lon`) for everything else. Private addresses stay empty |
+| fillnull | `value=` and an optional field list |
+| makemv / mvexpand | `delim=` |
+| spath | `input=`, `path=`, `output=` for JSON |
 | table, fields, sort, head, tail, rename, dedup | |
-| eval | arithmetic, `if`, `lower`, `upper`, `len`, `coalesce`, `tonumber`, `tostring` |
+| eval | `+ - * /`, `if`, `case`, `coalesce`, `round`, `len`, `lower`, `upper`, `substr`, `replace`, `strftime`, `strptime`, `relative_time`, `now`, `cidrmatch`, `match`, `split`, `mvcount`, `tostring`, `tonumber`, `true` |
 
-`earliest=-24h` and `latest=now` (including `@d`, `@h`, `@m`) work in the query or from the time picker.
+Not implemented, and rejected by name: `tstats`, `datamodel`, `from`, `mstats`, `appendcols`, `union`, `map`, `metadata`, `geostats`, `timewrap`, `predict`, `xmlkv`. `transaction` does not support `startswith` / `endswith`. Lookup matching is exact, not CIDR or wildcard.
+
+### Fields
+
+Palo Alto sourcetypes are `pan:traffic`, `pan:threat`, `pan:system`, `pan:config`, and `pan:globalprotect`. Cisco IOS / IOS-XE is `cisco:ios`. NX-OS facilities such as `ETHPORT` and `VSHD` are `cisco:nxos`.
+
+| Copied name | Also accepted | Meaning |
+| --- | --- | --- |
+| src, src_ip | | client address |
+| dest, dest_ip | dst, dst_ip | server address |
+| src_port, dest_port | dst_port | ports |
+| src_zone, dest_zone | dst_zone | zones |
+| src_interface | interface | ingress interface, and the Cisco interface |
+| dest_interface | | egress interface |
+| user, src_user | | user |
+| app, rule, protocol | transport | application, rule, IP protocol |
+| bytes, bytes_in, bytes_out | bytes_sent, bytes_received | totals and directions, matching the Palo Alto add-on (`bytes_in` is bytes received) |
+| action | vendor_action | original value: `allow`, `deny`, `drop`, `alert`, … |
+| cim_action | `action=allowed` or `action=blocked` also match | CIM: allow/alert/success → `allowed`; deny/drop/reset/block → `blocked` |
+| severity | severity_description | Palo Alto word (`critical`, `high`, `informational`) or Cisco word (`error`, `warning`, `notification`) |
+| severity_id | `severity<=3` | numeric syslog / mnemonic severity |
+| threat_name, category | http_category | threat and URL category |
+| facility, mnemonic, message_text | message | Cisco `%FACILITY-SEVERITY-MNEMONIC` body |
+| host, dvc, sourcetype, source, _time, _raw | index (accepted, not filtered) | the usual Splunk metadata. `index` does not select a different store |
+
+`_time`, `_raw`, `host`, `source`, and `sourcetype` are on every event. `source` is the sender address when syslog provided one.
 
 The UI is search (query bar, time range, timeline, field sidebar, event list or stats chart), saved searches, dashboards built from those searches, and scheduled alerts. Alert actions are a history log, an HTTP webhook, or email when SMTP is configured.
 

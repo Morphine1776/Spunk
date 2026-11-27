@@ -156,5 +156,15 @@ export const deleteAlert = (id: number) => send<void>(`/api/alerts/${id}`, { met
 export const runAlert = (id: number) => send<AlertHistory[]>(`/api/alerts/${id}/run`, { method: "POST" });
 export const alertHistory = () => send<AlertHistory[]>("/api/alerts/history");
 export const status = () => send<Status>("/api/status");
+export const listLookups = () => send<{ name: string; updatedUtc: string; bytes: number }[]>("/api/lookups");
+export async function getLookup(name: string) {
+  const response = await fetch(`/api/lookups/${encodeURIComponent(name)}`);
+  if (!response.ok) throw new Error(await response.text());
+  return response.text();
+}
+export async function saveLookup(name: string, csv: string) {
+  const response = await fetch(`/api/lookups/${encodeURIComponent(name)}`, { method: "PUT", body: csv, headers: { "Content-Type": "text/csv" } });
+  if (!response.ok) throw new Error(await response.text());
+}
 export const setRetention = (days: number) =>
   send<{ retentionDays: number }>("/api/settings/retention", { method: "PUT", body: JSON.stringify({ days }) });

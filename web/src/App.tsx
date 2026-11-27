@@ -1,6 +1,7 @@
 import { NavLink, Route, Routes } from "react-router-dom";
 import { AlertsPage } from "./pages/AlertsPage";
 import { DashboardPage, DashboardsPage } from "./pages/DashboardsPage";
+import { LookupsPage } from "./pages/LookupsPage";
 import { SearchPage } from "./pages/SearchPage";
 import { StatusPage } from "./pages/StatusPage";
 
@@ -19,6 +20,7 @@ export function App() {
           <NavLink to="/" end>Search</NavLink>
           <NavLink to="/dashboards">Dashboards</NavLink>
           <NavLink to="/alerts">Alerts</NavLink>
+          <NavLink to="/lookups">Lookups</NavLink>
           <NavLink to="/status">Status</NavLink>
         </nav>
       </header>
@@ -27,6 +29,7 @@ export function App() {
         <Route path="/dashboards" element={<DashboardsPage />} />
         <Route path="/dashboards/:slug" element={<DashboardPage />} />
         <Route path="/alerts" element={<AlertsPage />} />
+        <Route path="/lookups" element={<LookupsPage />} />
         <Route path="/status" element={<StatusPage />} />
       </Routes>
     </div>

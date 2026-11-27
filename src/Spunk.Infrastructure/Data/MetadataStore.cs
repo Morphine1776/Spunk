@@ -364,6 +364,140 @@ public sealed class MetadataStore
         cmd.Parameters.AddWithValue("@suppress", alert.SuppressMinutes);
     }
 
+    public async Task<List<LookupFile>> ListLookupsAsync(CancellationToken ct = default)
+    {
+        return await QueryAsync("SELECT Name, UpdatedUtc, LEN(Csv) FROM dbo.Lookups ORDER BY Name", null, reader => new LookupFile
+        {
+            Name = reader.GetString(0),
+            UpdatedUtc = DateTime.SpecifyKind(reader.GetDateTime(1), DateTimeKind.Utc),
+            Bytes = Convert.ToInt32(reader.GetValue(2)),
+        }, ct);
+    }
+
+    public async Task<string?> GetLookupCsvAsync(string name, CancellationToken ct = default)
+    {
+        var rows = await QueryAsync("SELECT Csv FROM dbo.Lookups WHERE Name = @name", cmd => cmd.Parameters.AddWithValue("@name", NormalizeLookup(name)), reader => reader.GetString(0), ct);
+        return rows.FirstOrDefault();
+    }
+
+    public async Task SaveLookupCsvAsync(string name, string csv, CancellationToken ct = default)
+    {
+        const string sql = """
+            MERGE dbo.Lookups AS t
+            USING (SELECT @name AS Name) AS s ON t.Name = s.Name
+            WHEN MATCHED THEN UPDATE SET Csv = @csv, UpdatedUtc = SYSUTCDATETIME()
+            WHEN NOT MATCHED THEN INSERT (Name, Csv) VALUES (@name, @csv);
+            """;
+        await ExecAsync(sql, cmd =>
+        {
+            cmd.Parameters.AddWithValue("@name", NormalizeLookup(name));
+            cmd.Parameters.AddWithValue("@csv", csv);
+        }, ct);
+    }
+
+    public async Task DeleteLookupAsync(string name, CancellationToken ct = default)
+    {
+        await ExecAsync("DELETE FROM dbo.Lookups WHERE Name = @name", cmd => cmd.Parameters.AddWithValue("@name", NormalizeLookup(name)), ct);
+    }
+
+    public List<Dictionary<string, string>> ReadLookup(string name)
+    {
+        var csv = GetLookupCsvAsync(name).GetAwaiter().GetResult();
+        return csv == null ? [] : ParseCsv(csv);
+    }
+
+    public void WriteLookup(string name, List<Dictionary<string, object?>> rows)
+    {
+        var headers = rows.SelectMany(row => row.Keys).Distinct(StringComparer.OrdinalIgnoreCase).Where(key => key is not ("_raw" or "_extra")).ToList();
+        var lines = new List<string> { string.Join(",", headers) };
+        foreach (var row in rows)
+        {
+            lines.Add(string.Join(",", headers.Select(header => CsvCell(row.TryGetValue(header, out var value) ? value?.ToString() : null))));
+        }
+
+        SaveLookupCsvAsync(name, string.Join("\n", lines)).GetAwaiter().GetResult();
+    }
+
+    public static List<Dictionary<string, string>> ParseCsv(string csv)
+    {
+        var lines = csv.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        if (lines.Length == 0)
+        {
+            return [];
+        }
+
+        var headers = SplitCsv(lines[0]);
+        var rows = new List<Dictionary<string, string>>();
+        for (var i = 1; i < lines.Length; i++)
+        {
+            var cells = SplitCsv(lines[i]);
+            var row = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (var c = 0; c < headers.Count && c < cells.Count; c++)
+            {
+                row[headers[c]] = cells[c];
+            }
+
+            rows.Add(row);
+        }
+
+        return rows;
+    }
+
+    private static List<string> SplitCsv(string line)
+    {
+        var cells = new List<string>();
+        var current = new System.Text.StringBuilder();
+        var quoted = false;
+        for (var i = 0; i < line.Length; i++)
+        {
+            var ch = line[i];
+            if (quoted)
+            {
+                if (ch == '"' && i + 1 < line.Length && line[i + 1] == '"')
+                {
+                    current.Append('"');
+                    i++;
+                }
+                else if (ch == '"')
+                {
+                    quoted = false;
+                }
+                else
+                {
+                    current.Append(ch);
+                }
+            }
+            else if (ch == '"')
+            {
+                quoted = true;
+            }
+            else if (ch == ',')
+            {
+                cells.Add(current.ToString());
+                current.Clear();
+            }
+            else
+            {
+                current.Append(ch);
+            }
+        }
+
+        cells.Add(current.ToString());
+        return cells;
+    }
+
+    private static string CsvCell(string? value)
+    {
+        value ??= "";
+        return value.Contains(',') || value.Contains('"') ? "\"" + value.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"" : value;
+    }
+
+    private static string NormalizeLookup(string name)
+    {
+        var trimmed = name.Trim();
+        return trimmed.EndsWith(".csv", StringComparison.OrdinalIgnoreCase) ? trimmed[..^4] : trimmed;
+    }
+
     private async Task<List<T>> QueryAsync<T>(string sql, Action<SqlCommand>? bind, Func<SqlDataReader, T> map, CancellationToken ct)
     {
         await using var conn = await OpenAsync(ct);
@@ -456,6 +590,13 @@ public sealed class AlertRecord
     public int SuppressMinutes { get; set; } = 15;
     public DateTime? LastRunUtc { get; set; }
     public DateTime? LastFiredUtc { get; set; }
+}
+
+public sealed class LookupFile
+{
+    public string Name { get; set; } = "";
+    public DateTime UpdatedUtc { get; set; }
+    public int Bytes { get; set; }
 }
 
 public sealed class AlertHistoryRecord

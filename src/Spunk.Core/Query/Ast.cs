@@ -32,7 +32,7 @@ public sealed record StatsStage(IReadOnlyList<Agg> Aggs, IReadOnlyList<string> B
 
 public sealed record TimechartStage(int? SpanSeconds, IReadOnlyList<Agg> Aggs, string? By) : SplStage;
 
-public sealed record TopStage(int Limit, string Field, string? By, bool Rare) : SplStage;
+public sealed record TopStage(int Limit, string Field, string? By, bool Rare, bool ShowPercent = true) : SplStage;
 
 public sealed record TableStage(IReadOnlyList<string> Fields) : SplStage;
 
@@ -52,6 +52,38 @@ public sealed record DedupStage(int Keep, IReadOnlyList<string> Fields) : SplSta
 
 public sealed record EvalStage(IReadOnlyList<(string Field, Ex Expr)> Assignments) : SplStage;
 
+public sealed record EventStatsStage(IReadOnlyList<Agg> Aggs, IReadOnlyList<string> By) : SplStage;
+
+public sealed record StreamStatsStage(IReadOnlyList<Agg> Aggs, IReadOnlyList<string> By, int? Window) : SplStage;
+
+public sealed record TransactionStage(IReadOnlyList<string> Fields, int? MaxSpanSeconds, int? MaxPauseSeconds) : SplStage;
+
+public sealed record JoinStage(string Type, IReadOnlyList<string> Fields, SplQuery Subsearch) : SplStage;
+
+public sealed record AppendStage(SplQuery Subsearch) : SplStage;
+
+public sealed record LookupStage(string Name, IReadOnlyList<(string EventField, string LookupField)> Keys, IReadOnlyList<(string LookupField, string Output)> Output) : SplStage;
+
+public sealed record InputLookupStage(string Name) : SplStage;
+
+public sealed record OutputLookupStage(string Name) : SplStage;
+
+public sealed record IpLocationStage(string Field, string? Prefix) : SplStage;
+
+public sealed record BinStage(string Field, int? SpanSeconds, double? SpanNumber) : SplStage;
+
+public sealed record ChartStage(IReadOnlyList<Agg> Aggs, string Over, string? By) : SplStage;
+
+public sealed record FillNullStage(string? Value, IReadOnlyList<string> Fields) : SplStage;
+
+public sealed record MakeMvStage(string Field, string Delimiter) : SplStage;
+
+public sealed record MvExpandStage(string Field) : SplStage;
+
+public sealed record SpathStage(string? Input, string? Path, string? Output) : SplStage;
+
+public sealed record RexStage(string? Field, string Pattern, bool Sed) : SplStage;
+
 public abstract record Sx;
 
 public sealed record SxTrue : Sx;
@@ -63,6 +95,10 @@ public sealed record SxBool(string Op, IReadOnlyList<Sx> Parts) : Sx;
 public sealed record SxTerm(string? Field, string Op, string Value) : Sx;
 
 public sealed record SxCall(string Name, IReadOnlyList<string> Args) : Sx;
+
+public sealed record SxIn(string Field, IReadOnlyList<string> Values, SplQuery? Subsearch) : Sx;
+
+public sealed record SxSub(SplQuery Query) : Sx;
 
 public abstract record Ex;
 
@@ -77,6 +113,8 @@ public sealed record ExBin(string Op, Ex Left, Ex Right) : Ex;
 public sealed record ExCall(string Name, IReadOnlyList<Ex> Args) : Ex;
 
 public sealed record ExIf(Ex Left, string Op, Ex Right, Ex Then, Ex Else) : Ex;
+
+public sealed record ExCmp(Ex Left, string Op, Ex Right) : Ex;
 
 public sealed class CompiledQuery
 {

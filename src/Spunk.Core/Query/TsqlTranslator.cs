@@ -12,7 +12,7 @@ public static class TsqlTranslator
             throw new QueryException("Time range is empty.");
         }
 
-        return new Compiler(DateTime.SpecifyKind(fromUtc, DateTimeKind.Utc), DateTime.SpecifyKind(toUtc, DateTimeKind.Utc), Math.Clamp(maxRows, 1, 10_000)).Compile(query);
+        return new Compiler(DateTime.SpecifyKind(fromUtc, DateTimeKind.Utc), DateTime.SpecifyKind(toUtc, DateTimeKind.Utc), Math.Clamp(maxRows, 1, 50_000)).Compile(query);
     }
 
     private sealed class Compiler
@@ -35,15 +35,27 @@ public static class TsqlTranslator
             new("src", "SrcIp", ColType.String),
             new("dst_ip", "DstIp", ColType.String),
             new("dst", "DstIp", ColType.String),
+            new("dest_ip", "DstIp", ColType.String),
+            new("dest", "DstIp", ColType.String),
             new("src_port", "SrcPort", ColType.Int64),
             new("dst_port", "DstPort", ColType.Int64),
+            new("dest_port", "DstPort", ColType.Int64),
             new("src_zone", "SrcZone", ColType.String),
             new("dst_zone", "DstZone", ColType.String),
+            new("dest_zone", "DstZone", ColType.String),
             new("protocol", "Protocol", ColType.String),
+            new("transport", "Protocol", ColType.String),
             new("action", "Action", ColType.String),
+            new("vendor_action", "Action", ColType.String),
+            new("cim_action", SplFields.CimActionSql, ColType.String),
             new("rule", "RuleName", ColType.String),
             new("app", "Application", ColType.String),
             new("user", "UserName", ColType.String),
+            new("src_user", "UserName", ColType.String),
+            new("dvc", "Host", ColType.String),
+            new("message_text", "Message", ColType.String),
+            new("severity_description", "SeverityName", ColType.String),
+            new("severity_id", "Severity", ColType.Int64),
             new("bytes", "BytesTotal", ColType.Int64),
             new("bytes_in", "BytesIn", ColType.Int64),
             new("bytes_received", "BytesIn", ColType.Int64),
@@ -52,7 +64,14 @@ public static class TsqlTranslator
             new("packets", "Packets", ColType.Int64),
             new("threat_name", "ThreatName", ColType.String),
             new("category", "ThreatCategory", ColType.String),
+            new("http_category", "ThreatCategory", ColType.String),
             new("interface", "Interface", ColType.String),
+            new("src_interface", "Interface", ColType.String),
+            new("log_subtype", "JSON_VALUE(ExtraJson, '$.subtype')", ColType.String),
+            new("dest_interface", "COALESCE(JSON_VALUE(ExtraJson, '$.dest_interface'), JSON_VALUE(ExtraJson, '$.outbound_if'))", ColType.String),
+            new("serial_number", "COALESCE(JSON_VALUE(ExtraJson, '$.serial_number'), JSON_VALUE(ExtraJson, '$.serial'))", ColType.String),
+            new("src_translated_ip", "JSON_VALUE(ExtraJson, '$.natsrc')", ColType.String),
+            new("session_end_reason", "JSON_VALUE(ExtraJson, '$.session_end_reason')", ColType.String),
             new("device", "DeviceName", ColType.String),
             new("session_id", "SessionId", ColType.String),
             new("repeat_count", "RepeatCount", ColType.Int64),
@@ -146,6 +165,27 @@ ORDER BY t.[_time]";
             };
         }
 
+        private static string CommandName(SplStage stage) => stage switch
+        {
+            RexStage => "rex",
+            EventStatsStage => "eventstats",
+            StreamStatsStage => "streamstats",
+            TransactionStage => "transaction",
+            JoinStage => "join",
+            AppendStage => "append",
+            LookupStage => "lookup",
+            InputLookupStage => "inputlookup",
+            OutputLookupStage => "outputlookup",
+            IpLocationStage => "iplocation",
+            BinStage => "bin",
+            ChartStage => "chart",
+            FillNullStage => "fillnull",
+            MakeMvStage => "makemv",
+            MvExpandStage => "mvexpand",
+            SpathStage => "spath",
+            _ => stage.GetType().Name.Replace("Stage", "", StringComparison.Ordinal).ToLowerInvariant(),
+        };
+
         private void Apply(SplStage stage)
         {
             switch (stage)
@@ -196,7 +236,7 @@ ORDER BY t.[_time]";
                     ApplyEval(eval);
                     break;
                 default:
-                    throw new QueryException("Unsupported command.");
+                    throw new QueryException($"Search command '{CommandName(stage)}' is not supported.");
             }
         }
 
@@ -731,11 +771,28 @@ FROM (SELECT DISTINCT CONVERT(nvarchar(450), s2.{B(arg)}) AS v FROM {cte} AS s2 
             SxBool boolean => string.Join(boolean.Op == "OR" ? " OR " : " AND ", boolean.Parts.Select(p => "(" + CompileSx(p) + ")")),
             SxTerm term => CompileTerm(term),
             SxCall call => CompileCall(call),
+            SxIn list => CompileIn(list),
+            SxSub => throw new QueryException("A subsearch was not expanded before SQL translation."),
             _ => throw new QueryException("Unsupported search expression."),
         };
 
         private string CompileTerm(SxTerm term)
         {
+            if (term.Field != null && term.Field.Equals("index", StringComparison.OrdinalIgnoreCase))
+            {
+                return "1=1";
+            }
+
+            if (term.Field != null && term.Field.Equals("severity", StringComparison.OrdinalIgnoreCase) && term.Op is "=" or "!=" or "<" or ">" or "<=" or ">=")
+            {
+                return CompileSeverity(term);
+            }
+
+            if (term.Field != null && term.Field.Equals("action", StringComparison.OrdinalIgnoreCase) && term.Op is "=" or "!=" && !HasWild(term.Value))
+            {
+                return CompileAction(term);
+            }
+
             if (term.Field == null)
             {
                 var like = Add(LikePattern(term.Value, substring: true), ParamType.NVarChar);
@@ -781,6 +838,51 @@ FROM (SELECT DISTINCT CONVERT(nvarchar(450), s2.{B(arg)}) AS v FROM {cte} AS s2 
             }
 
             return $"{expr} {op} {Add(term.Value, ParamType.NVarChar)}";
+        }
+
+        private string CompileSeverity(SxTerm term)
+        {
+            var sqlOp = term.Op == "!=" ? "<>" : term.Op;
+            if (int.TryParse(term.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var number) && term.Op is "<" or ">" or "<=" or ">=" or "=" or "!=")
+            {
+                var id = $"Severity {sqlOp} {Add(number, ParamType.Int)}";
+                if (term.Op is "=" or "!=")
+                {
+                    var words = SplFields.SeverityWords(term.Value);
+                    var name = "(" + string.Join(" OR ", words.Select(w => $"SeverityName = {Add(w, ParamType.NVarChar)}")) + ")";
+                    return term.Op == "=" ? $"({id} OR {name})" : $"({id} AND NOT {name})";
+                }
+
+                return id;
+            }
+
+            var equivalents = SplFields.SeverityWords(term.Value);
+            var match = "(" + string.Join(" OR ", equivalents.Select(w => $"SeverityName = {Add(w, ParamType.NVarChar)}")) + ")";
+            return term.Op == "!=" ? "NOT " + match : match;
+        }
+
+        private string CompileAction(SxTerm term)
+        {
+            var parameter = Add(term.Value, ParamType.NVarChar);
+            var both = $"(Action = {parameter} OR {SplFields.CimActionSql} = {parameter})";
+            return term.Op == "!=" ? $"NOT {both}" : both;
+        }
+
+        private string CompileIn(SxIn list)
+        {
+            if (list.Subsearch != null)
+            {
+                throw new QueryException("A subsearch was not expanded before SQL translation.");
+            }
+
+            if (list.Values.Count == 0)
+            {
+                return "1=0";
+            }
+
+            var expr = Resolve(list.Field);
+            var parameters = list.Values.Select(value => Add(value, ParamType.NVarChar));
+            return $"{expr} IN ({string.Join(", ", parameters)})";
         }
 
         private string CompileCall(SxCall call) => call.Name switch
@@ -890,7 +992,7 @@ FROM (SELECT DISTINCT CONVERT(nvarchar(450), s2.{B(arg)}) AS v FROM {cte} AS s2 
                 "avg" => $"AVG(TRY_CONVERT(float, {arg}))",
                 "min" => $"MIN({arg})",
                 "max" => $"MAX({arg})",
-                _ => throw new QueryException($"Unsupported aggregation '{agg.Func}'."),
+                _ => throw new QueryException($"The stats function '{agg.Func}' is not supported."),
             };
         }
 

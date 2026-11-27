@@ -7,8 +7,10 @@ public static class SplParser
 {
     private static readonly HashSet<string> Commands = new(StringComparer.OrdinalIgnoreCase)
     {
-        "search", "where", "stats", "timechart", "top", "rare", "table", "fields",
-        "sort", "head", "tail", "rename", "dedup", "eval",
+        "search", "where", "stats", "eventstats", "streamstats", "timechart", "chart", "top", "rare",
+        "table", "fields", "sort", "head", "tail", "rename", "dedup", "eval", "rex", "transaction",
+        "join", "lookup", "inputlookup", "outputlookup", "iplocation", "bin", "bucket", "fillnull",
+        "makemv", "mvexpand", "spath", "append",
     };
 
     public static SplQuery Parse(string input)
@@ -21,7 +23,7 @@ public static class SplParser
         }
 
         var cursor = new Cursor(input);
-        query.Stages.Add(cursor.ParseStage(query));
+        query.Stages.Add(cursor.ParseStage(query, false));
         while (cursor.Eat('|'))
         {
             if (cursor.IsEof)
@@ -29,7 +31,7 @@ public static class SplParser
                 throw cursor.Error("Expected a command after '|'.");
             }
 
-            query.Stages.Add(cursor.ParseStage(query));
+            query.Stages.Add(cursor.ParseStage(query, true));
         }
 
         cursor.Skip();
@@ -62,7 +64,7 @@ public static class SplParser
             }
         }
 
-        public SplStage ParseStage(SplQuery query)
+        public SplStage ParseStage(SplQuery query, bool afterPipe)
         {
             if (EatCommand("search"))
             {
@@ -134,6 +136,92 @@ public static class SplParser
                 return new EvalStage(EvalParser.Parse(ReadRestOfStage()));
             }
 
+            if (EatCommand("eventstats"))
+            {
+                return ParseEventStats();
+            }
+
+            if (EatCommand("streamstats"))
+            {
+                return ParseStreamStats();
+            }
+
+            if (EatCommand("chart"))
+            {
+                return ParseChart();
+            }
+
+            if (EatCommand("rex"))
+            {
+                return ParseRex();
+            }
+
+            if (EatCommand("transaction"))
+            {
+                return ParseTransaction();
+            }
+
+            if (EatCommand("join"))
+            {
+                return ParseJoin();
+            }
+
+            if (EatCommand("lookup"))
+            {
+                return ParseLookup();
+            }
+
+            if (EatCommand("inputlookup"))
+            {
+                return new InputLookupStage(ReadWord());
+            }
+
+            if (EatCommand("outputlookup"))
+            {
+                return new OutputLookupStage(ReadWord());
+            }
+
+            if (EatCommand("iplocation"))
+            {
+                return ParseIpLocation();
+            }
+
+            if (EatCommand("bin") || EatCommand("bucket"))
+            {
+                return ParseBin();
+            }
+
+            if (EatCommand("fillnull"))
+            {
+                return ParseFillNull();
+            }
+
+            if (EatCommand("makemv"))
+            {
+                return ParseMakeMv();
+            }
+
+            if (EatCommand("mvexpand"))
+            {
+                return new MvExpandStage(ReadField());
+            }
+
+            if (EatCommand("spath"))
+            {
+                return ParseSpath();
+            }
+
+            if (EatCommand("append"))
+            {
+                Expect('[');
+                return new AppendStage(ParseNestedQuery());
+            }
+
+            if (afterPipe && LooksLikeUnknownCommand(out var unknown))
+            {
+                throw Error($"Search command '{unknown}' is not supported.");
+            }
+
             return new SearchStage(ParseTopExpr(query, true));
         }
 
@@ -176,9 +264,16 @@ public static class SplParser
         private Agg ParseAgg()
         {
             var func = ReadWord().ToLowerInvariant();
-            if (func is not ("count" or "dc" or "sum" or "avg" or "min" or "max" or "values"))
+            if (func is "distinct_count")
             {
-                throw Error($"Unknown aggregation '{func}'.");
+                func = "dc";
+            }
+
+            if (func is not ("count" or "dc" or "sum" or "avg" or "min" or "max" or "values" or "list"
+                or "latest" or "earliest" or "first" or "last" or "median" or "stdev" or "stdevp"
+                or "perc" or "perc50" or "perc95" or "perc99"))
+            {
+                throw Error($"The stats function '{func}' is not supported.");
             }
 
             string? arg = null;
@@ -187,6 +282,11 @@ public static class SplParser
                 if (!Peek(')'))
                 {
                     arg = ReadField();
+                    if (func == "perc" && Eat(','))
+                    {
+                        var pct = ReadInt();
+                        func = pct switch { 95 => "perc95", 99 => "perc99", _ => "perc50" };
+                    }
                 }
 
                 Expect(')');
@@ -225,10 +325,419 @@ public static class SplParser
 
         private TopStage ParseTop(bool rare)
         {
-            var limit = PeekBareInt() ? ReadInt() : 10;
-            var field = ReadField();
-            string? by = EatKeyword("by") ? ReadField() : null;
-            return new TopStage(limit, field, by, rare);
+            var limit = 10;
+            var show = true;
+            string? field = null;
+            string? by = null;
+            while (!IsEof && !Peek('|') && !Peek(']'))
+            {
+                if (EatKeyword("limit"))
+                {
+                    Expect('=');
+                    limit = ReadInt();
+                    continue;
+                }
+
+                if (EatKeyword("showperc"))
+                {
+                    Expect('=');
+                    show = ReadBool();
+                    continue;
+                }
+
+                if (EatKeyword("countfield") || EatKeyword("percentfield") || EatKeyword("useother") || EatKeyword("otherstr"))
+                {
+                    Expect('=');
+                    ReadValue();
+                    continue;
+                }
+
+                if (field == null && PeekBareInt())
+                {
+                    limit = ReadInt();
+                    continue;
+                }
+
+                if (EatKeyword("by"))
+                {
+                    by = ReadField();
+                    continue;
+                }
+
+                if (field == null)
+                {
+                    field = ReadField();
+                    continue;
+                }
+
+                break;
+            }
+
+            if (field == null)
+            {
+                throw Error(rare ? "rare needs a field." : "top needs a field.");
+            }
+
+            return new TopStage(limit, field, by, rare, show);
+        }
+
+        private EventStatsStage ParseEventStats()
+        {
+            var aggs = ParseAggList();
+            return new EventStatsStage(aggs, ParseBy());
+        }
+
+        private StreamStatsStage ParseStreamStats()
+        {
+            int? window = null;
+            if (EatKeyword("window"))
+            {
+                Expect('=');
+                window = ReadInt();
+            }
+
+            var aggs = ParseAggList();
+            return new StreamStatsStage(aggs, ParseBy(), window);
+        }
+
+        private ChartStage ParseChart()
+        {
+            var aggs = ParseAggList();
+            if (!EatKeyword("over"))
+            {
+                throw Error("chart needs 'over'.");
+            }
+
+            var over = ReadField();
+            return new ChartStage(aggs, over, EatKeyword("by") ? ReadField() : null);
+        }
+
+        private RexStage ParseRex()
+        {
+            string? field = null;
+            var sed = false;
+            while (true)
+            {
+                if (EatKeyword("field"))
+                {
+                    Expect('=');
+                    field = ReadField();
+                    continue;
+                }
+
+                if (EatKeyword("mode"))
+                {
+                    Expect('=');
+                    sed = ReadWord().Equals("sed", StringComparison.OrdinalIgnoreCase);
+                    continue;
+                }
+
+                break;
+            }
+
+            return new RexStage(field, ReadString(), sed);
+        }
+
+        private TransactionStage ParseTransaction()
+        {
+            var fields = new List<string>();
+            int? span = null;
+            int? pause = null;
+            while (!IsEof && !Peek('|') && !Peek(']'))
+            {
+                if (EatKeyword("maxspan"))
+                {
+                    Expect('=');
+                    span = RelativeTime.ParseSpan(ReadWord());
+                    continue;
+                }
+
+                if (EatKeyword("maxpause"))
+                {
+                    Expect('=');
+                    pause = RelativeTime.ParseSpan(ReadWord());
+                    continue;
+                }
+
+                if (PeekKeyword("startswith") || PeekKeyword("endswith") || PeekKeyword("connected"))
+                {
+                    ReadWord();
+                    if (Eat('='))
+                    {
+                        ReadValue();
+                    }
+
+                    continue;
+                }
+
+                if (!(_i < _s.Length && (char.IsLetter(_s[_i]) || _s[_i] == '_')))
+                {
+                    break;
+                }
+
+                fields.Add(ReadField());
+            }
+
+            if (fields.Count == 0)
+            {
+                throw Error("transaction needs at least one field.");
+            }
+
+            return new TransactionStage(fields, span, pause);
+        }
+
+        private JoinStage ParseJoin()
+        {
+            var type = "inner";
+            var fields = new List<string>();
+            while (!IsEof && !Peek('|') && !Peek('['))
+            {
+                if (EatKeyword("type"))
+                {
+                    Expect('=');
+                    type = ReadWord();
+                    continue;
+                }
+
+                if (EatKeyword("max"))
+                {
+                    Expect('=');
+                    ReadInt();
+                    continue;
+                }
+
+                fields.Add(ReadField());
+            }
+
+            Expect('[');
+            return new JoinStage(type, fields, ParseNestedQuery());
+        }
+
+        private LookupStage ParseLookup()
+        {
+            var name = ReadWord();
+            var keys = new List<(string, string)>();
+            while (!IsEof && !Peek('|') && !PeekKeyword("OUTPUT") && !PeekKeyword("OUTPUTNEW"))
+            {
+                var local = ReadField();
+                var remote = local;
+                if (EatKeyword("as"))
+                {
+                    remote = ReadField();
+                }
+
+                keys.Add((local, remote));
+                Eat(',');
+            }
+
+            var output = new List<(string, string)>();
+            if (EatKeyword("OUTPUT") || EatKeyword("OUTPUTNEW"))
+            {
+                while (!IsEof && !Peek('|'))
+                {
+                    var field = ReadField();
+                    var alias = field;
+                    if (EatKeyword("as"))
+                    {
+                        alias = ReadField();
+                    }
+
+                    output.Add((field, alias));
+                    if (!Eat(','))
+                    {
+                        if (IsEof || Peek('|') || !(_i < _s.Length && (char.IsLetter(_s[_i]) || _s[_i] == '_')))
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            return new LookupStage(name, keys, output);
+        }
+
+        private IpLocationStage ParseIpLocation()
+        {
+            string? prefix = null;
+            if (EatKeyword("prefix"))
+            {
+                Expect('=');
+                prefix = ReadValue();
+            }
+
+            var field = IsEof || Peek('|') ? "src_ip" : ReadField();
+            return new IpLocationStage(field, prefix);
+        }
+
+        private BinStage ParseBin()
+        {
+            string? field = null;
+            int? seconds = null;
+            double? number = null;
+            while (!IsEof && !Peek('|'))
+            {
+                if (EatKeyword("span"))
+                {
+                    Expect('=');
+                    var text = ReadWord();
+                    if (text.Any(char.IsLetter))
+                    {
+                        seconds = RelativeTime.ParseSpan(text);
+                    }
+                    else
+                    {
+                        number = double.Parse(text, CultureInfo.InvariantCulture);
+                    }
+
+                    continue;
+                }
+
+                if (field == null)
+                {
+                    field = ReadField();
+                    continue;
+                }
+
+                break;
+            }
+
+            return new BinStage(field ?? "_time", seconds, number);
+        }
+
+        private FillNullStage ParseFillNull()
+        {
+            string? value = null;
+            if (EatKeyword("value"))
+            {
+                Expect('=');
+                value = ReadValue();
+            }
+
+            var fields = new List<string>();
+            while (!IsEof && !Peek('|') && (_i < _s.Length && (char.IsLetter(_s[_i]) || _s[_i] == '_')))
+            {
+                fields.Add(ReadField());
+                Eat(',');
+            }
+
+            return new FillNullStage(value, fields);
+        }
+
+        private MakeMvStage ParseMakeMv()
+        {
+            var delim = ",";
+            if (EatKeyword("delim"))
+            {
+                Expect('=');
+                delim = ReadValue();
+            }
+            else if (EatKeyword("tokenizer"))
+            {
+                Expect('=');
+                ReadValue();
+            }
+
+            return new MakeMvStage(ReadField(), delim);
+        }
+
+        private SpathStage ParseSpath()
+        {
+            string? input = null;
+            string? path = null;
+            string? output = null;
+            while (true)
+            {
+                if (EatKeyword("input"))
+                {
+                    Expect('=');
+                    input = ReadField();
+                    continue;
+                }
+
+                if (EatKeyword("path"))
+                {
+                    Expect('=');
+                    path = ReadValue();
+                    continue;
+                }
+
+                if (EatKeyword("output"))
+                {
+                    Expect('=');
+                    output = ReadField();
+                    continue;
+                }
+
+                break;
+            }
+
+            return new SpathStage(input, path, output);
+        }
+
+        private SplQuery ParseNestedQuery()
+        {
+            var nested = new SplQuery();
+            if (Peek(']'))
+            {
+                Expect(']');
+                nested.Stages.Add(new SearchStage(new SxTrue()));
+                return nested;
+            }
+
+            nested.Stages.Add(ParseStage(nested, false));
+            while (Eat('|'))
+            {
+                if (Peek(']'))
+                {
+                    break;
+                }
+
+                nested.Stages.Add(ParseStage(nested, true));
+            }
+
+            Expect(']');
+            return nested;
+        }
+
+        private bool LooksLikeUnknownCommand(out string name)
+        {
+            name = "";
+            var save = _i;
+            Skip();
+            if (IsEof || Peek('(') || Peek('"') || Peek('\'') || Peek('[') || Peek('|'))
+            {
+                _i = save;
+                return false;
+            }
+
+            if (_i >= _s.Length || !(char.IsLetter(_s[_i]) || _s[_i] == '_'))
+            {
+                _i = save;
+                return false;
+            }
+
+            var word = ReadWord();
+            if (word.Equals("NOT", StringComparison.OrdinalIgnoreCase) || word.Equals("AND", StringComparison.OrdinalIgnoreCase) || word.Equals("OR", StringComparison.OrdinalIgnoreCase))
+            {
+                _i = save;
+                return false;
+            }
+
+            Skip();
+            if (Peek('=') || Peek('<') || Peek('>') || Peek('!'))
+            {
+                _i = save;
+                return false;
+            }
+
+            name = word;
+            return true;
+        }
+
+        private bool ReadBool()
+        {
+            var word = ReadWord();
+            return word is not ("0" or "f" or "false" or "no" or "n");
         }
 
         private FieldsStage ParseFields()
@@ -394,11 +903,27 @@ public static class SplParser
 
         private Sx ParsePrimary(SplQuery query, bool captureTime)
         {
+            if (Eat('['))
+            {
+                return new SxSub(ParseNestedQuery());
+            }
+
             if (Eat('('))
             {
                 var inner = ParseOr(query, captureTime);
                 Expect(')');
                 return inner;
+            }
+
+            if (EatKeyword("cidrmatch") || EatKeyword("match"))
+            {
+                var name = LastKeyword();
+                Expect('(');
+                var left = ReadValue();
+                Expect(',');
+                var right = ReadValue();
+                Expect(')');
+                return new SxCall(name, [left, right]);
             }
 
             if (EatKeyword("isnull") || EatKeyword("isnotnull"))
@@ -426,6 +951,33 @@ public static class SplParser
             }
 
             var word = ReadWord();
+            if (EatKeyword("IN"))
+            {
+                if (!IsIdent(word))
+                {
+                    throw Error($"'{word}' is not a valid field name.");
+                }
+
+                if (Eat('['))
+                {
+                    return new SxIn(word, [], ParseNestedQuery());
+                }
+
+                Expect('(');
+                var values = new List<string>();
+                if (!Peek(')'))
+                {
+                    values.Add(ReadValue());
+                    while (Eat(','))
+                    {
+                        values.Add(ReadValue());
+                    }
+                }
+
+                Expect(')');
+                return new SxIn(word, values, null);
+            }
+
             var op = TryReadOp();
             if (op == null)
             {
@@ -480,7 +1032,7 @@ public static class SplParser
                 return false;
             }
 
-            if (Peek('(') || Peek('"') || Peek('\'') || PeekKeyword("NOT") || PeekKeyword("isnull") || PeekKeyword("isnotnull") || PeekKeyword("like"))
+            if (Peek('(') || Peek('[') || Peek('"') || Peek('\'') || PeekKeyword("NOT") || PeekKeyword("isnull") || PeekKeyword("isnotnull") || PeekKeyword("like") || PeekKeyword("cidrmatch") || PeekKeyword("match"))
             {
                 return true;
             }
@@ -586,7 +1138,17 @@ public static class SplParser
                 var c = _s[_i++];
                 if (c == '\\' && _i < _s.Length)
                 {
-                    sb.Append(_s[_i++]);
+                    var escaped = _s[_i];
+                    if (escaped is '\\' or '"' or '\'')
+                    {
+                        sb.Append(escaped);
+                        _i++;
+                    }
+                    else
+                    {
+                        sb.Append(c);
+                    }
+
                     continue;
                 }
 
@@ -814,7 +1376,7 @@ public static class SplParser
             char.IsLetterOrDigit(c) || c is '_' or '.' or ':' or '*' or '?' or '/' or '\\' or '%' or '@';
 
         private static bool IsWordPart(char c) =>
-            IsWordStart(c) || c is '-' or ';' or '#' or '$' or '[' or ']';
+            IsWordStart(c) || c is '-' or ';' or '#' or '$';
 
         public static bool IsIdent(string word) =>
             word.Length > 0 && (char.IsLetter(word[0]) || word[0] == '_') && word.All(ch => char.IsLetterOrDigit(ch) || ch == '_');
@@ -949,6 +1511,24 @@ internal static class EvalParser
                 return new ExIf(left, op, right, then, els);
             }
 
+            if (ident.Equals("case", StringComparison.OrdinalIgnoreCase))
+            {
+                var pairs = new List<Ex>();
+                while (!Peek(')'))
+                {
+                    pairs.Add(ParseCaseCond());
+                    Expect(',');
+                    pairs.Add(ParseExpr());
+                    if (!Eat(','))
+                    {
+                        break;
+                    }
+                }
+
+                Expect(')');
+                return new ExCall("case", pairs);
+            }
+
             var args = new List<Ex>();
             if (!Peek(')'))
             {
@@ -1006,6 +1586,53 @@ internal static class EvalParser
             return value;
         }
 
+        private Ex ParseCaseCond()
+        {
+            var left = ParseExpr();
+            if (!TryCompare(out var op))
+            {
+                return left;
+            }
+
+            return new ExCmp(left, op, ParseExpr());
+        }
+
+        private bool TryCompare(out string op)
+        {
+            var save = _i;
+            Skip();
+            if (StartsWith("!="))
+            {
+                _i += 2;
+                op = "!=";
+                return true;
+            }
+
+            if (StartsWith(">="))
+            {
+                _i += 2;
+                op = ">=";
+                return true;
+            }
+
+            if (StartsWith("<="))
+            {
+                _i += 2;
+                op = "<=";
+                return true;
+            }
+
+            if (Peek('=') || Peek('>') || Peek('<'))
+            {
+                op = Next().ToString();
+                return true;
+            }
+
+            _i = save;
+            op = "";
+            return false;
+        }
+
         private string ReadCompare()
         {
             Skip();
@@ -1045,7 +1672,17 @@ internal static class EvalParser
                 var c = _s[_i++];
                 if (c == '\\' && _i < _s.Length)
                 {
-                    sb.Append(_s[_i++]);
+                    var escaped = _s[_i];
+                    if (escaped is '\\' or '"' or '\'')
+                    {
+                        sb.Append(escaped);
+                        _i++;
+                    }
+                    else
+                    {
+                        sb.Append(c);
+                    }
+
                     continue;
                 }
 

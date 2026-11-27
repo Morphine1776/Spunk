@@ -40,6 +40,15 @@ builder.Services.AddCors(options => options.AddDefaultPolicy(policy =>
 
 var app = builder.Build();
 await MigrateWithRetry(app, connectionString);
+var searchService = app.Services.GetRequiredService<SearchService>();
+var metadata = app.Services.GetRequiredService<MetadataStore>();
+searchService.LookupReader = metadata.ReadLookup;
+searchService.LookupWriter = metadata.WriteLookup;
+var geoPath = app.Configuration["GeoIp:CsvPath"];
+if (!string.IsNullOrWhiteSpace(geoPath))
+{
+    searchService.Geo.AddRange(GeoIp.LoadCsv(geoPath));
+}
 
 app.UseExceptionHandler(handler => handler.Run(async context =>
 {
@@ -251,6 +260,29 @@ app.MapPost("/api/ingest", async (HttpRequest request, IngestHost ingest, Ingest
     }
 
     return Results.Ok(new { count });
+});
+
+app.MapGet("/api/lookups", async (MetadataStore store, CancellationToken ct) => Results.Ok(await store.ListLookupsAsync(ct)));
+app.MapGet("/api/lookups/{name}", async (string name, MetadataStore store, CancellationToken ct) =>
+{
+    var csv = await store.GetLookupCsvAsync(name, ct);
+    return csv == null ? Results.NotFound() : Results.Text(csv, "text/csv");
+});
+app.MapPut("/api/lookups/{name}", async (string name, HttpRequest request, MetadataStore store, CancellationToken ct) =>
+{
+    var csv = await new StreamReader(request.Body).ReadToEndAsync(ct);
+    if (string.IsNullOrWhiteSpace(csv) || !csv.Contains(','))
+    {
+        return Results.BadRequest(new { error = "Upload a CSV with a header row." });
+    }
+
+    await store.SaveLookupCsvAsync(name, csv, ct);
+    return Results.Ok(new { name });
+});
+app.MapDelete("/api/lookups/{name}", async (string name, MetadataStore store, CancellationToken ct) =>
+{
+    await store.DeleteLookupAsync(name, ct);
+    return Results.NoContent();
 });
 
 app.MapFallbackToFile("index.html");

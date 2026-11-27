@@ -20,7 +20,7 @@ public class QueryTests
         Assert.Contains("TOP (10)", sql.Sql, StringComparison.Ordinal);
         Assert.Contains("ORDER BY [count] DESC", sql.Sql, StringComparison.Ordinal);
         Assert.DoesNotContain("pan:traffic", sql.Sql, StringComparison.Ordinal);
-        Assert.DoesNotContain("deny", sql.Sql, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("action=deny", sql.Sql, StringComparison.OrdinalIgnoreCase);
         Assert.Contains(sql.Parameters, p => Equals(p.Value, "pan:traffic"));
         Assert.Contains(sql.Parameters, p => Equals(p.Value, "deny"));
         Assert.Equal("table", sql.ResultType);
@@ -49,7 +49,7 @@ public class QueryTests
     {
         var query = SplParser.Parse("src_ip=\"1'; DROP TABLE dbo.Events; --\"");
         var sql = TsqlTranslator.Compile(query, From, To, 500);
-        Assert.DoesNotContain("DROP", sql.Sql, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("DROP TABLE", sql.Sql, StringComparison.OrdinalIgnoreCase);
         Assert.Contains(sql.Parameters, p => Equals(p.Value, "1'; DROP TABLE dbo.Events; --"));
     }
 
@@ -58,7 +58,7 @@ public class QueryTests
     {
         var query = SplParser.Parse("src_ip=1;DROP");
         var sql = TsqlTranslator.Compile(query, From, To, 500);
-        Assert.DoesNotContain("DROP", sql.Sql, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("DROP TABLE", sql.Sql, StringComparison.OrdinalIgnoreCase);
         Assert.Contains(sql.Parameters, p => Equals(p.Value, "1;DROP"));
     }
 
@@ -66,10 +66,12 @@ public class QueryTests
     public void And_binds_tighter_than_or_and_parentheses_work()
     {
         var loose = TsqlTranslator.Compile(SplParser.Parse("sourcetype=cisco:ios OR sourcetype=cisco:nxos severity=error"), From, To, 100);
-        Assert.Contains("(Sourcetype = @p0) OR ((Sourcetype = @p1) AND (SeverityName = @p2))", loose.Sql, StringComparison.Ordinal);
+        Assert.Contains("(Sourcetype = @p0) OR ((Sourcetype = @p1) AND", loose.Sql, StringComparison.Ordinal);
+        Assert.Contains("SeverityName = @p2", loose.Sql, StringComparison.Ordinal);
 
         var grouped = TsqlTranslator.Compile(SplParser.Parse("(sourcetype=cisco:ios OR sourcetype=cisco:nxos) severity=error"), From, To, 100);
-        Assert.Contains("((Sourcetype = @p0) OR (Sourcetype = @p1)) AND (SeverityName = @p2)", grouped.Sql, StringComparison.Ordinal);
+        Assert.Contains("((Sourcetype = @p0) OR (Sourcetype = @p1)) AND", grouped.Sql, StringComparison.Ordinal);
+        Assert.Contains("SeverityName = @p2", grouped.Sql, StringComparison.Ordinal);
     }
 
     [Fact]

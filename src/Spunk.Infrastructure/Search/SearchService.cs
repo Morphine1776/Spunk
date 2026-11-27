@@ -33,15 +33,40 @@ public sealed class SearchService
 
     public string ConnectionString { get; }
 
-    public async Task<SearchResponse> SearchAsync(string query, string? earliest, string? latest, int limit, CancellationToken ct = default)
+    public Func<string, List<Dictionary<string, string>>>? LookupReader { get; set; }
+
+    public Action<string, List<Dictionary<string, object?>>>? LookupWriter { get; set; }
+
+    public List<(string Cidr, GeoIp.Place Place)> Geo { get; } = [];
+
+    public Task<SearchResponse> SearchAsync(string query, string? earliest, string? latest, int limit, CancellationToken ct = default) =>
+        ExecuteAsync(SplParser.Parse(string.IsNullOrWhiteSpace(query) ? "*" : query), query, earliest, latest, limit, ct, 0);
+
+    private async Task<SearchResponse> ExecuteAsync(SplQuery parsed, string query, string? earliest, string? latest, int limit, CancellationToken ct, int depth)
     {
-        var parsed = SplParser.Parse(string.IsNullOrWhiteSpace(query) ? "*" : query);
+        if (depth > 4)
+        {
+            throw new QueryException("Subsearches are nested too deeply.");
+        }
+
+        List<Dictionary<string, object?>> Run(SplQuery sub)
+        {
+            var text = query;
+            return ExecuteAsync(sub, text, sub.Earliest ?? earliest, sub.Latest ?? latest, 2000, ct, depth + 1).GetAwaiter().GetResult().Rows;
+        }
+
+        RowEngine.ExpandSubsearches(parsed, Run);
         var now = DateTime.UtcNow;
         var from = RelativeTime.Resolve(parsed.Earliest ?? earliest ?? "-24h", now);
         var to = RelativeTime.Resolve(parsed.Latest ?? latest ?? "now", now);
         if (to <= from)
         {
             to = from.AddMinutes(1);
+        }
+
+        if (!SqlPush.CanFullyPush(parsed))
+        {
+            return await PostProcessAsync(parsed, query, from, to, now, Run, ct);
         }
 
         var compiled = TsqlTranslator.Compile(parsed, from, to, limit <= 0 ? 500 : limit);
@@ -79,6 +104,65 @@ public sealed class SearchService
         response.Timeline = await ReadTimelineAsync(conn, compiled, ct);
         response.ElapsedMs = (int)clock.ElapsedMilliseconds;
         return response;
+    }
+
+    private async Task<SearchResponse> PostProcessAsync(SplQuery parsed, string query, DateTime from, DateTime to, DateTime now, Func<SplQuery, List<Dictionary<string, object?>>> run, CancellationToken ct)
+    {
+        var clock = Stopwatch.StartNew();
+        List<Dictionary<string, object?>> seed = [];
+        if (parsed.Stages.FirstOrDefault() is not InputLookupStage)
+        {
+            var fetch = new SplQuery();
+            foreach (var stage in parsed.Stages)
+            {
+                if (stage is SearchStage search && SqlPush.FilterPushable(search.Expr))
+                {
+                    fetch.Stages.Add(search);
+                }
+                else if (stage is WhereStage where && SqlPush.FilterPushable(where.Expr))
+                {
+                    fetch.Stages.Add(where);
+                }
+                else
+                {
+                    break;
+                }
+            }
+
+            if (fetch.Stages.Count == 0)
+            {
+                fetch.Stages.Add(new SearchStage(new SxTrue()));
+            }
+
+            var compiled = TsqlTranslator.Compile(fetch, from, to, 20000);
+            await using var conn = new SqlConnection(ConnectionString);
+            await conn.OpenAsync(ct);
+            seed = await ReadRowsAsync(conn, compiled.Sql, compiled.Parameters, ct);
+        }
+
+        var engine = RowEngine.Execute(parsed, seed, new EngineContext
+        {
+            Now = now,
+            Subsearch = run,
+            Lookup = LookupReader,
+            SaveLookup = LookupWriter,
+            Geo = Geo,
+        });
+        return new SearchResponse
+        {
+            Query = query,
+            ResultType = engine.ResultType,
+            From = from,
+            To = to,
+            Total = engine.Rows.Count,
+            Rows = engine.Rows,
+            Columns = engine.Rows.Count == 0 ? [] : engine.Rows.SelectMany(row => row.Keys).Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
+            CategoryField = engine.CategoryField,
+            SplitBy = engine.SplitBy,
+            Measures = engine.Measures,
+            Sql = "post-processed in the API after a parameterized event fetch",
+            ElapsedMs = (int)clock.ElapsedMilliseconds,
+        };
     }
 
     public async Task<List<FieldSummary>> FieldsAsync(string query, string? earliest, string? latest, CancellationToken ct = default)
