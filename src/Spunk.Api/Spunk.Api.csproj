@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <ItemGroup>
+    <ProjectReference Include="..\Spunk.Core\Spunk.Core.csproj" />
+    <ProjectReference Include="..\Spunk.Infrastructure\Spunk.Infrastructure.csproj" />
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.1" />
+  </ItemGroup>
+</Project>

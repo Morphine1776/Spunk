@@ -1,0 +1,11 @@
+bin/
+obj/
+wwwroot/
+web/node_modules/
+web/dist/
+.vs/
+*.user
+TestResults/
+.idea/
+*.log
+appsettings.Local.json
